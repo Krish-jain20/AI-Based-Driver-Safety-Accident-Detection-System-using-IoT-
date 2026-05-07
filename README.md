@@ -46,13 +46,6 @@ The sensors continuously collect data related to vehicle motion, alcohol vapour,
 - Emergency service notification
 - Machine learning-based prediction
 
-## Team Members
-- Krish Jain
-- Annanya Dobariyal
-- Ishaan Singla
-
-## Guide
-Ms. Nidhi Sharma
 
 ## Department
 Department of Computer Science and Engineering  
