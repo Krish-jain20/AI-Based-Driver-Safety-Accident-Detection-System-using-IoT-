@@ -1,0 +1,250 @@
+/*
+ *
+ *  Hardware :
+ *    - ESP32
+ *    - MPU6050  (I2C  → SDA=19, SCL=18)
+ *    - MQ-3     (Analog → GPIO 34)
+ *    - SW-420   (Digital → GPIO 27)
+ *    - Buzzer   (Digital → GPIO 25)
+ *
+ *  Sensors send data to ESP32 → threshold evaluation
+ *  → Buzzer (local) + Telegram notification (remote)
+ * ============================================================
+ */
+
+// ── Libraries ───────────────────────────────────────────────
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <math.h>
+
+// ── WiFi Credentials ────────────────────────────────────────
+const char* WIFI_SSID     = "JAY SHREE RAM";       // <-- change this
+const char* WIFI_PASSWORD = "Samar@3529";   // <-- change this
+
+// ── Telegram Bot Credentials ─────────────────────────────────
+const String BOT_TOKEN  = "8728553943:AAE8n8zzFJUh_QYSVNRgfvEgWB1TzL2GZGw";         // <-- from BotFather
+const String CHAT_ID    = "1855523086";           // <-- your chat ID
+
+// ── Pin Definitions ─────────────────────────────────────────
+#define BUZZER_PIN       25
+#define VIBRATION_PIN    27
+#define ALCOHOL_PIN      34
+
+// ── Sensor Thresholds (calibrated as per report) ─────────────
+/*
+ *  Alcohol  : ADC value 400 out of 4095 (12-bit ADC, ESP32)
+ *             Report states: "Threshold: 400"
+ *
+ *  Tilt     : ±30° from horizontal
+ *             At rest, Z ≈ 9.8 m/s²  (1g gravity)
+ *             Tilt threshold uses combined XY acceleration
+ *             If sqrt(ax²+ay²) > 9.8 * sin(30°) ≈ 4.9 m/s²
+ *             → abnormal tilt
+ *
+ *  Vibration: SW-420 digital HIGH = impact detected
+ */
+const int   ALCOHOL_THRESHOLD   = 400;    // ADC value (0–4095)
+const float TILT_THRESHOLD_DEG  = 30.0;  // degrees from horizontal
+const float TILT_THRESHOLD_MS2  = 9.8f * sin(TILT_THRESHOLD_DEG * PI / 180.0f);
+                                          // ≈ 4.9 m/s²
+
+// ── MPU6050 Object ───────────────────────────────────────────
+Adafruit_MPU6050 mpu;
+
+// ── Telegram Helper ─────────────────────────────────────────
+void sendTelegramAlert(String message) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  String url = "https://api.telegram.org/bot" + BOT_TOKEN +
+               "/sendMessage?chat_id=" + CHAT_ID +
+               "&text=" + message;
+
+  http.begin(url);
+  int httpCode = http.GET();
+
+  if (httpCode == 200) {
+    Serial.println("Telegram Message Sent Successfully.");
+  } else {
+    Serial.print("Telegram Error. HTTP Code: ");
+    Serial.println(httpCode);
+  }
+  http.end();
+}
+
+// ── Buzzer Helper ────────────────────────────────────────────
+void activateBuzzer(int durationMs) {
+  Serial.println("Buzzer Activated.");
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(durationMs);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+// ════════════════════════════════════════════════════════════
+//  SETUP
+// ════════════════════════════════════════════════════════════
+void setup() {
+
+  Serial.begin(115200);
+  delay(2000);
+
+  Serial.println("System Starting...");
+
+  // ── Pin modes ───────────────────────────────────────────
+  pinMode(BUZZER_PIN,    OUTPUT);
+  pinMode(VIBRATION_PIN, INPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  // ── MPU6050 init (I2C: SDA=19, SCL=18) ─────────────────
+  Wire.begin(19, 18);
+
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 not found. Check wiring.");
+    while (true) delay(1000);   // halt — no point continuing
+  }
+  Serial.println("MPU6050 Detected and Initialized Successfully");
+
+  // ── MPU6050 sensitivity settings ───────────────────────
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  // ── WiFi connection ─────────────────────────────────────
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  int attempt = 0;
+  while (WiFi.status() != WL_CONNECTED && attempt < 20) {
+    delay(500);
+    Serial.print(".");
+    attempt++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.print("WiFi Connected. IP Address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println();
+    Serial.println("WiFi Connection Failed. Running in local-only mode.");
+  }
+
+  Serial.println("System Ready. Monitoring started.");
+  Serial.println("-------------------------------------------");
+}
+
+// ════════════════════════════════════════════════════════════
+//  LOOP
+// ════════════════════════════════════════════════════════════
+void loop() {
+
+  // ── Read MPU6050 ────────────────────────────────────────
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  // ── Read Sensors ────────────────────────────────────────
+  int   alcoholValue   = analogRead(ALCOHOL_PIN);
+  int   vibrationValue = digitalRead(VIBRATION_PIN);
+
+  // Tilt calculation: XY resultant (gravity on Z at rest ≈ 9.8)
+  float tiltXY = sqrt(
+    (a.acceleration.x * a.acceleration.x) +
+    (a.acceleration.y * a.acceleration.y)
+  );
+
+  // ── Normal Reading Log ──────────────────────────────────
+  Serial.println("--- Normal Readings ---");
+
+  Serial.print("Alcohol Level: ");
+  Serial.print(alcoholValue);
+  if (alcoholValue <= ALCOHOL_THRESHOLD) Serial.println(" (Safe)");
+  else                                   Serial.println(" (ALERT)");
+
+  Serial.print("Vibration: ");
+  Serial.println(vibrationValue == HIGH ? "Impact Detected" : "No Impact");
+
+  Serial.print("Motion X: "); Serial.print(a.acceleration.x);
+  Serial.print("  Y: ");      Serial.print(a.acceleration.y);
+  Serial.print("  Z: ");      Serial.println(a.acceleration.z);
+
+  bool alertTriggered = false;
+
+  // ════════════════════════════════════════════════════════
+  //  DECISION ENGINE — Threshold Evaluation
+  // ════════════════════════════════════════════════════════
+
+  // ── 1. Alcohol Detection ─────────────────────────────────
+  /*
+   *  MQ-3 outputs analog voltage ∝ alcohol concentration.
+   *  ESP32 12-bit ADC range: 0–4095.
+   *  Calibrated threshold: 400 (empirically tested).
+   *  Response: Buzzer 300 ms + Telegram alert.
+   */
+  if (alcoholValue > ALCOHOL_THRESHOLD) {
+    alertTriggered = true;
+    Serial.println("--- Alert Triggered ---");
+    Serial.print("Alcohol Detected! Level: ");
+    Serial.print(alcoholValue);
+    Serial.print(" (Threshold: ");
+    Serial.print(ALCOHOL_THRESHOLD);
+    Serial.println(")");
+
+    activateBuzzer(300);
+
+    Serial.println("Sending Telegram Alert: Alcohol Detected!");
+    sendTelegramAlert("⚠️ DRIVER SAFETY ALERT: Alcohol detected in vehicle! Immediate attention required.");
+  }
+
+  // ── 2. Vibration / Collision Detection ───────────────────
+  /*
+   *  SW-420 digital sensor outputs HIGH on significant vibration.
+   *  Sensitivity adjustable via on-board potentiometer.
+   *  Response: Buzzer 400 ms + Telegram alert.
+   */
+  if (vibrationValue == HIGH) {
+    alertTriggered = true;
+    if (!alertTriggered) Serial.println("--- Alert Triggered ---");
+    Serial.println("Strong Vibration Detected! Impact Detected.");
+    Serial.println("Accident Alert Triggered!");
+
+    activateBuzzer(400);
+
+    Serial.println("Sending Telegram Alert: Accident Detected!");
+    sendTelegramAlert("🚨 ACCIDENT ALERT: Strong vibration/collision detected! Please check on the driver immediately.");
+  }
+
+  // ── 3. Abnormal Tilt / Motion Detection ──────────────────
+  /*
+   *  MPU6050 measures acceleration on X, Y, Z axes.
+   *  At rest (flat), Z ≈ 9.8 m/s², X & Y ≈ 0.
+   *  Tilt detection: XY resultant > 9.8 × sin(30°) ≈ 4.9 m/s²
+   *  This corresponds to the vehicle tilting beyond ±30°.
+   *  Response: Buzzer 500 ms + Telegram alert.
+   */
+  if (tiltXY > TILT_THRESHOLD_MS2) {
+    alertTriggered = true;
+    Serial.println("MPU6050: Abnormal Tilt/Motion Detected.");
+    Serial.print("Tilt Magnitude (XY): ");
+    Serial.print(tiltXY);
+    Serial.print(" m/s²  (Threshold: ");
+    Serial.print(TILT_THRESHOLD_MS2);
+    Serial.println(" m/s²)");
+
+    activateBuzzer(500);
+
+    Serial.println("Sending Telegram Alert: Abnormal Motion Detected!");
+    sendTelegramAlert("📍 MOTION ALERT: Abnormal vehicle tilt or motion detected. Driver safety at risk.");
+  }
+
+  // ── Status divider ──────────────────────────────────────
+  if (!alertTriggered) {
+    Serial.println("Status: All parameters SAFE.");
+  }
+  Serial.println("-------------------------------------------");
+
+  // ── Polling interval: 500 ms (as per report design) ─────
+  delay(500);
+}
